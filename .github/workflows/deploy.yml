@@ -1,24 +1,49 @@
-name: Deploy to ECS
+name: Deploy to ECS per environment
 
 on:
   push:
     branches:
       - dev
+      - qa
+      - pp
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-  CLUSTER: ${{ secrets.CLUSTER_NAME }}
-  SERVICE: ${{ secrets.SERVICE_NAME }}
-  TASK_FAMILY: ${{ secrets.TASK_FAMILY }}
 
 jobs:
   deploy:
+    name: Deploy ${{ github.ref_name }}
     runs-on: ubuntu-latest
 
+    env:
+      BRANCH_NAME: ${{ github.ref_name }}
+
     steps:
-      - name: Checkout repo
+      - name: Checkout source code
         uses: actions/checkout@v3
+
+      - name: Set environment-specific values
+        id: setenv
+        run: |
+          if [[ "${BRANCH_NAME}" == "dev" ]]; then
+            echo "ECR_REPOSITORY=ecs-dev" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=ecs-dev" >> $GITHUB_ENV
+            echo "SERVICE_NAME=service-dev" >> $GITHUB_ENV
+            echo "TASK_FAMILY=app-dev" >> $GITHUB_ENV
+          elif [[ "${BRANCH_NAME}" == "qa" ]]; then
+            echo "ECR_REPOSITORY=ecs-qa" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=ecs-qa" >> $GITHUB_ENV
+            echo "SERVICE_NAME=service-qa" >> $GITHUB_ENV
+            echo "TASK_FAMILY=app-qa" >> $GITHUB_ENV
+          elif [[ "${BRANCH_NAME}" == "pp" ]]; then
+            echo "ECR_REPOSITORY=ecs-pp" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=ecs-pp" >> $GITHUB_ENV
+            echo "SERVICE_NAME=service-pp" >> $GITHUB_ENV
+            echo "TASK_FAMILY=app-pp" >> $GITHUB_ENV
+          else
+            echo "Invalid branch: ${BRANCH_NAME}"
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
@@ -27,43 +52,43 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Log in to Amazon ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build and tag Docker image
+      - name: Build and push Docker image to ECR
         run: |
           IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
           docker build -t $IMAGE_URI .
+          docker push $IMAGE_URI
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-      - name: Push Docker image to ECR
+      - name: Prepare new task definition
         run: |
-          docker push $IMAGE_URI
+          aws ecs describe-task-definition \
+            --task-definition $TASK_FAMILY \
+            --query 'taskDefinition' \
+            > old-task.json
 
-      - name: Register new ECS task definition
-        id: task-def
+          cat old-task.json | jq --arg IMAGE "$IMAGE_URI" \
+          '. | {
+            family: .family,
+            networkMode: .networkMode,
+            requiresCompatibilities: .requiresCompatibilities,
+            cpu: .cpu,
+            memory: .memory,
+            executionRoleArn: .executionRoleArn,
+            containerDefinitions: (.containerDefinitions | map(.image = $IMAGE))
+          }' > new-task-def.json
+
+      - name: Register updated task definition
         run: |
-          TASK_DEF=$(aws ecs describe-task-definition --task-definition $TASK_FAMILY)
-          NEW_DEF=$(echo $TASK_DEF | jq --arg IMAGE "$IMAGE_URI" '
-            .taskDefinition |
-            {
-              family: .family,
-              networkMode: .networkMode,
-              requiresCompatibilities: .requiresCompatibilities,
-              cpu: .cpu,
-              memory: .memory,
-              executionRoleArn: .executionRoleArn,
-              containerDefinitions: (
-                .containerDefinitions | map(
-                  .image = $IMAGE
-                )
-              )
-            }')
-          echo "$NEW_DEF" > new-task-def.json
           aws ecs register-task-definition --cli-input-json file://new-task-def.json
 
-      - name: Update ECS service with new task def
+      - name: Update ECS service
         run: |
           REVISION=$(aws ecs describe-task-definition --task-definition $TASK_FAMILY --query 'taskDefinition.revision' --output text)
-          aws ecs update-service --cluster $CLUSTER --service $SERVICE --task-definition $TASK_FAMILY:$REVISION
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --task-definition $TASK_FAMILY:$REVISION
